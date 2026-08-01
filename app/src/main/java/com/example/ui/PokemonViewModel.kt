@@ -1,5 +1,9 @@
 package com.example.ui
 
+import android.app.Application
+import android.graphics.Bitmap
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
 import com.example.api.*
 import com.example.data.*
@@ -10,10 +14,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.net.URLEncoder
-import android.app.Application
-import android.graphics.Bitmap
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 
 sealed interface MainSearchUiState {
     object Idle : MainSearchUiState
@@ -75,6 +75,10 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
         _selectedRarity.value = rarity
     }
 
+    /**
+     * Parse query text to handle compound queries. Highly robust and scores results 
+     * to sort the best matches (such as when selected from search history) at index 0.
+     */
     fun performTextSearch(rawQuery: String) {
         if (rawQuery.isBlank()) return
 
@@ -82,6 +86,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
             _searchUiState.value = MainSearchUiState.Loading
             _selectedCard.value = null
             
+            // Add entry to search history
             repository.addHistory(
                 SearchHistoryEntry(
                     query = rawQuery,
@@ -93,11 +98,13 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
                 var queryParam = buildSearchQuery(rawQuery, _selectedRarity.value)
                 var response = PokemonTcgClient.apiService.searchCards(queryParam)
                 
+                // Fallback 1: If rarity was set, try without rarity
                 if (response.data.isEmpty() && !_selectedRarity.value.isNullOrBlank()) {
                     queryParam = buildSearchQuery(rawQuery, null)
                     response = PokemonTcgClient.apiService.searchCards(queryParam)
                 }
                 
+                // Fallback 2: If no matches with number-parsed, search purely by name terms
                 if (response.data.isEmpty()) {
                     val terms = rawQuery.trim().split(Regex("\\s+"))
                     val nameOnly = terms.filter { !it.matches(Regex("(?i)^(\\d+(/\\d+)?|[a-zA-Z]+\\d+|\\d+[a-zA-Z]+)$")) }.joinToString(" ")
@@ -108,24 +115,30 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
                 if (response.data.isEmpty()) {
                     _searchUiState.value = MainSearchUiState.Error("Nie znaleziono żadnych kart Pokémon o podanych kryteriach. Spróbuj zmienić zapytanie.")
                 } else {
+                    // Score and sort search results to place the most matching card on top (guarantees correct history card displaying)
                     val queryWords = rawQuery.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
                     val sortedList = response.data.sortedByDescending { card ->
                         var score = 0
                         for (word in queryWords) {
                             val cleanWord = word.trim()
                             if (cleanWord.isEmpty()) continue
+                            
+                            // Check card name
                             if (card.name.lowercase().contains(cleanWord)) {
                                 score += 100
                                 if (card.name.lowercase() == cleanWord) score += 50
                             }
+                            // Check card number
                             val cleanWordNum = cleanWord.substringBefore("/")
                             if (card.number.lowercase().contains(cleanWordNum)) {
                                 score += 200
                                 if (card.number.lowercase() == cleanWordNum) score += 100
                             }
+                            // Check set name
                             if (card.set.name.lowercase().contains(cleanWord)) {
                                 score += 50
                             }
+                            // Check set series
                             if (card.set.series.lowercase().contains(cleanWord)) {
                                 score += 20
                             }
@@ -134,6 +147,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
                     }
 
                     _searchUiState.value = MainSearchUiState.Success(sortedList)
+                    // Auto-select the top-scored card
                     _selectedCard.value = sortedList.first()
                 }
             } catch (e: Exception) {
@@ -142,6 +156,9 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Performs standard search after OCR extraction
+     */
     fun performOcrSearch(name: String, number: String?, setKeyword: String?) {
         viewModelScope.launch {
             _searchUiState.value = MainSearchUiState.Loading
@@ -160,6 +177,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
             )
 
             try {
+                // Build robust structured card query
                 val queryParam = buildString {
                     append("name:\"*$name*\"")
                     if (!number.isNullOrBlank()) {
@@ -170,6 +188,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
                 
                 var response = PokemonTcgClient.apiService.searchCards(queryParam)
                 
+                // Fallback: If no cards found with numeric filters, search purely by name instead
                 if (response.data.isEmpty()) {
                     response = PokemonTcgClient.apiService.searchCards("name:\"*$name*\"")
                 }
@@ -177,14 +196,17 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
                 if (response.data.isEmpty()) {
                     _searchUiState.value = MainSearchUiState.Error("Pokemon TCG API nie zwróciło kart dla zidentyfikowanej nazwy: '$name'.")
                 } else {
+                    // Score and sort response list to place the exact match at index 0
                     val sortedList = response.data.sortedByDescending { card ->
                         var score = 0
+                        // 1. Name match
                         if (card.name.equals(name, ignoreCase = true)) {
                             score += 1000
                         } else if (card.name.contains(name, ignoreCase = true)) {
                             score += 500
                         }
                         
+                        // 2. Number match
                         if (!number.isNullOrBlank()) {
                             val cleanScanned = number.replace(Regex("[^0-9a-zA-Z]"), "").lowercase().trim()
                             val cleanCardNum = card.number.replace(Regex("[^0-9a-zA-Z]"), "").lowercase().trim()
@@ -195,6 +217,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
                             }
                         }
                         
+                        // 3. Set Name / Keyword Match
                         if (!setKeyword.isNullOrBlank()) {
                             val cleanSetKw = setKeyword.lowercase().trim()
                             val cleanSetName = card.set.name.lowercase().trim()
@@ -222,20 +245,23 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
     private fun handleApiException(e: Exception): String {
         return if (e is retrofit2.HttpException) {
             when (e.code()) {
-                500 -> "Błąd serwera (HTTP 500): Wewnętrzny błąd serwera Pokémon TCG."
-                502, 503, 504 -> "Błąd serwera (HTTP ${e.code()}): Usługa zewnętrzna jest przeciążona."
-                429 -> "Limit zapytań przekroczony (HTTP 429)."
+                500 -> "Błąd serwera (HTTP 500): Wewnętrzny błąd serwera Pokémon TCG. Przeprowadzono automatyczne próbkowania, lecz serwer jest niedostępny lub odrzucił zapytanie."
+                502, 503, 504 -> "Błąd serwera (HTTP ${e.code()}): Usługa zewnętrzna jest przeciążona lub nieodpowiada. Spróbuj ponownie za chwilę."
+                429 -> "Limit zapytań przekroczony (HTTP 429). Odczekaj chwilę przed kolejnym wyszukiwaniem."
                 else -> "Błąd sieciowy HTTP ${e.code()}: ${e.message()}"
             }
         } else {
-            "Błąd pobierania danych: ${e.localizedMessage ?: "Nieznany błąd."}"
+            "Błąd pobierania danych: ${e.localizedMessage ?: "Nieznany błąd połączenia."}"
         }
     }
 
+    /**
+     * Conduct multi-modal card identification via Gemini
+     */
     fun analyzeImageAndSearch(bitmap: Bitmap) {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
-            _searchUiState.value = MainSearchUiState.Error("Klucz Gemini API nie został ustawiony.")
+            _searchUiState.value = MainSearchUiState.Error("Klucz Gemini API nie został ustawiony w portfelu sekretów (Secrets Panel w AI Studio). Proszę go skonfigurować, aby włączyć rozpoznawanie obrazu.")
             return
         }
 
@@ -255,7 +281,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
 
             val cardName = ocrResult.name
             if (cardName.isNullOrBlank()) {
-                _searchUiState.value = MainSearchUiState.Error("Nie udało się odczytać nazwy karty.")
+                _searchUiState.value = MainSearchUiState.Error("Nie udało się odczytać nazwy karty ze zdjęcia.")
                 _analysingResultText.value = null
                 return@launch
             }
@@ -278,6 +304,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // Favorite Management
     fun isFavorite(cardId: String): Boolean {
         return favorites.value.any { it.id == cardId }
     }
@@ -288,6 +315,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
             if (exists) {
                 repository.deleteFavorite(card.id)
             } else {
+                // Extract price averages for saving
                 val tcgLow = getTcgPlayerPrice(card, "low")
                 val tcgMid = getTcgPlayerPrice(card, "mid")
                 val tcgHigh = getTcgPlayerPrice(card, "high")
@@ -324,8 +352,10 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // UTILITIES FOR PRICING EXTRACTS
     fun getTcgPlayerPrice(card: TcgCard, type: String): Double? {
         val pricesGroup = card.tcgplayer?.prices ?: return null
+        // Inspect normal, holofoil, reverseHolofoil sequentially to find the first populated double
         val candidates = listOfNotNull(
             pricesGroup.normal,
             pricesGroup.holofoil,
@@ -343,6 +373,7 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // HELPERS FOR LINK GENERATION
     private fun padNumberSegment(segment: String): String {
         val num = segment.toIntOrNull()
         return if (num != null && segment.length < 3) {
@@ -383,12 +414,38 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Fraza dla Allegro/OLX: bez oficjalnej (angielskiej) nazwy setu, bo w realnych
+     * ogłoszeniach na tych portalach sprzedający prawie nigdy jej nie wpisują
+     * (np. piszą "151" zamiast "Scarlet & Violet 151") — dodatkowe słowa tylko
+     * zaśmiecają zapytanie i pogarszają trafność wyników. Zera wiodące w numerze
+     * karty (np. "025/165") są zachowane zgodnie z ustaleniami.
+     */
+    fun buildMarketplaceSearchPhrase(card: TcgCard): String {
+        val rawNumber = card.number.trim()
+        val printedTotal = card.set.printedTotal
+
+        val formattedNumber = if (rawNumber.contains("/")) {
+            rawNumber.split("/").joinToString("/") { padNumberSegment(it.trim()) }
+        } else if (printedTotal != null) {
+            "${padNumberSegment(rawNumber)}/${padNumberSegment(printedTotal.toString())}"
+        } else {
+            padNumberSegment(rawNumber)
+        }
+
+        val name = sanitizeSearchQueryText(card.name)
+        return "$formattedNumber $name"
+    }
+
     fun getAllegroLink(card: TcgCard): String {
-        val query = buildExternalSearchPhrase(card)
+        val query = buildMarketplaceSearchPhrase(card)
         return "https://allegro.pl/listing?string=${urlEncode(query)}"
     }
 
     fun getPokekartyLink(card: TcgCard): String {
+        // pokekarty.pl to sklep na WordPress/WooCommerce, a nie PrestaShop —
+        // prawidłowy adres wyszukiwania to parametr "s" (+ post_type=product),
+        // a nie "/szukaj?controller=search" (to nieistniejąca na tej stronie trasa).
         val query = buildExternalSearchPhrase(card)
         return "https://www.pokekarty.pl/?s=${urlEncode(query)}&post_type=product"
     }
@@ -417,22 +474,30 @@ class PokemonViewModel(application: Application) : AndroidViewModel(application)
 
     fun getOlxLink(card: TcgCard): String {
         val loc = _olxLocation.value
-        val query = buildExternalSearchPhrase(card)
+        val query = buildMarketplaceSearchPhrase(card)
         val encodedQuery = urlEncode(query)
         
         return if (loc.isNotBlank() && loc != "Brak filtru" && loc != "Kraj (brak)") {
-            val locSlug = slugify(loc)
+            // OLX nie rozpoznaje przedrostka "województwo"/"woj." w adresie — segment
+            // ścieżki to sama nazwa regionu (np. "swietokrzyskie", nie "wojewodztwo-swietokrzyskie"),
+            // inaczej link prowadzi na nieistniejącą stronę (404).
+            val normalizedLoc = loc.replace(Regex("(?i)^woj(ew[oó]dztwo|\\.)\\s+"), "")
+            val locSlug = slugify(normalizedLoc)
             "https://www.olx.pl/${locSlug}/q-${encodedQuery}/"
         } else {
             "https://www.olx.pl/oferty/q-${encodedQuery}/"
         }
     }
 
+    // PRIVATES
     private fun buildSearchQuery(rawQuery: String, rarity: String? = null): String {
         val cleanQuery = rawQuery.trim()
         if (cleanQuery.isBlank()) return ""
 
         val terms = cleanQuery.split(Regex("\\s+"))
+        
+        // Find a term that represents the card number
+        // e.g. "143/198", "TG12", "SV1", "25", "025/025"
         val numberTerm = terms.firstOrNull { term ->
             term.matches(Regex("(?i)^(\\d+(/\\d+)?|[a-zA-Z]+\\d+|\\d+[a-zA-Z]+)$"))
         }
