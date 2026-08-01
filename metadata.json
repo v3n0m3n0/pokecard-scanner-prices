@@ -1,0 +1,6 @@
+{
+  "name": "PokeCard Scanner & Prices",
+  "description": "Scan or search Pokemon cards to view real-time global and Polish market prices.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
